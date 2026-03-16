@@ -46,8 +46,8 @@ Branch C uses VideoMamba backbone which has O(n) complexity vs O(n²) for Transf
 
 ```bash
 # 1. Clone repo
-git clone https://github.com/Prachet-Dev-Singh/SurveillAI_VAD.git
-cd SurveillAI_VAD
+git clone https://github.com/Prachet-Dev-Singh/SurveillAI-VAD.git
+cd SurveillAI-VAD
 
 # 2. Create and activate environment
 python -m venv .venv
