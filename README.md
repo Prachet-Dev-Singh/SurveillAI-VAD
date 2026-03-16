@@ -13,12 +13,14 @@ A research-grade implementation of unsupervised video anomaly detection for CCTV
 
 ## Architecture Comparison
 
+*Note: The performance metrics (AUC-ROC and Inference time) are currently being benchmarked to reflect the empirical results from our local training runs on the UCSD Ped2 dataset. Parameter counts are static based on the architecture.*
+
 | Model | AUC-ROC | Params | Inference (ms/frame) |
 |---|---|---|---|
-| CNN Autoencoder (baseline) | ~74–78% | ~2M | ~5ms |
-| ViT-S + Temporal Attn | ~86–89% | ~22M | ~30ms |
-| ViT-S + Temporal + Distillation | ~85–88% | ~16M | ~23ms |
-| VideoMamba (MambaVision-T) | ~85–88% | ~8M | ~15ms |
+| CNN Autoencoder (baseline) | TBD | ~2M | TBD |
+| ViT-S + Temporal Attn | TBD | ~22M | TBD |
+| ViT-S + Temporal + Distillation | TBD | ~16M | TBD |
+| VideoMamba (MambaVision-T) | TBD | ~8M | TBD |
 
 ## Installation
 
