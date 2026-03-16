@@ -27,7 +27,7 @@ A research-grade implementation of unsupervised video anomaly detection for CCTV
 ### 1. Clone and Setup Environment
 
 ```bash
-git clone https://github.com/your-username/surveillai-vad
+git clone https://github.com/Prachet-Dev-Singh/SurveillAI-VAD
 cd surveillai-vad
 python -m venv .venv
 source .venv/bin/activate  # On Windows: .venv\Scripts\activate
@@ -328,4 +328,4 @@ MIT License - See LICENSE file for details
 ---
 
 **Author:** Prachet Dev Singh
-**Date:** 2025
+**Date:** 2026
