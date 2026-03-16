@@ -28,7 +28,7 @@ A research-grade implementation of unsupervised video anomaly detection for CCTV
 
 ```bash
 git clone https://github.com/Prachet-Dev-Singh/SurveillAI-VAD
-cd surveillai-vad
+cd SurveillAI-VAD
 python -m venv .venv
 source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 ```
