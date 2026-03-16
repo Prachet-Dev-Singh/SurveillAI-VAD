@@ -46,8 +46,8 @@ Branch C uses VideoMamba backbone which has O(n) complexity vs O(n²) for Transf
 
 ```bash
 # 1. Clone repo
-git clone https://github.com/your-repo/surveillai-vad
-cd surveillai-vad
+git clone https://github.com/Prachet-Dev-Singh/SurveillAI_VAD.git
+cd SurveillAI_VAD
 
 # 2. Create and activate environment
 python -m venv .venv
@@ -120,6 +120,7 @@ surveillai-vad/
 ├── train_vit.py                  # Advanced ViT training (temporal + distillation)
 ├── evaluate.py                   # Evaluation & metrics computation
 ├── visualize.py                  # Heatmap and attention visualizations
+├── student_loader.py             # NEW: Distilled model inference wrapper
 ├── compile_results.py            # Results compilation and comparison
 ├── setup.py                      # Interactive setup script
 ├── requirements.txt              # Python dependencies
@@ -145,10 +146,10 @@ python evaluate.py --checkpoint checkpoints/cnn_best.pth --config configs/cnn.ya
 ```
 
 **Expected Results:**
-- Training time: ~15 min (CPU)
-- Final loss: ~0.01
-- AUC-ROC: 74-78%
-- Inference: ~5 ms/frame
+- Training time: TBD
+- Final loss: TBD
+- AUC-ROC: TBD
+- Inference: TBD
 
 **Outputs:**
 - `checkpoints/cnn_best.pth`: Model weights
@@ -189,10 +190,10 @@ use_distillation: false     # Set to true for distillation training
 ```
 
 **Expected Results:**
-- Training time: 100-150 min (CPU)
-- AUC-ROC: 86-89% (without distillation)
-- AUC-ROC: 85-88% (with distillation)
-- Inference: 30 ms/frame (base), 23 ms/frame (distilled)
+- Training time: TBD
+- AUC-ROC: TBD (without distillation)
+- AUC-ROC: TBD (with distillation)
+- Inference: TBD (base), TBD (distilled)
 - Parameter reduction: 25% (with distillation)
 
 ### VideoMamba - Efficient Alternative
@@ -211,9 +212,9 @@ python visualize.py --checkpoint checkpoints/mamba_best.pth --frame_dir data/pro
 ```
 
 **Expected Results:**
-- Training time: 100 min (CPU)
-- AUC-ROC: 85-88%
-- Inference: 15 ms/frame (2x faster than ViT)
+- Training time: TBD
+- AUC-ROC: TBD
+- Inference: TBD
 - Parameters: 8M (1/3 of ViT)
 
 ## Key Modules Explained
@@ -336,6 +337,26 @@ python visualize.py \
     --threshold 0.01
 ```
 
+### 9. Inference & Visualization Updates
+
+**Production-Ready Improvements:**
+
+- **`student_loader.py`**: A custom runtime wrapper that pairs the Teacher's ViT Spatial Encoder with the highly compressed Student MLP for end-to-end frame inference.
+  - Enables seamless inference on 517KB distilled models
+  - Identical API to baseline CNN and ViT models
+  - Supports all checkpoint formats
+
+- **Dynamic Loading**: `evaluate.py` and `visualize.py` now utilize intelligent `state_dict` inspection to dynamically load the correct architecture (CNN, ViT, or Student) without hardcoding.
+  - Auto-detects model type from checkpoint
+  - Eliminates `RuntimeError: Unexpected key(s)` crashes
+  - Scales to future architectures automatically
+
+- **Tensor Format Standardization**: Automatic HWC → BCHW shape conversion ensures compatibility across different input sources and prevents shape mismatches during batch processing.
+
+- **Recursive Frame Discovery**: Fixed glob patterns to find frames in nested test subdirectories (e.g., Test001/, Test002/) instead of only searching the root directory.
+
+- **Color Space Correction**: BGR → RGB conversion for heatmaps ensures anomaly regions display with correct warm colors (red/yellow) for intuitive interpretation.
+
 ## FastAPI Deployment
 
 ### Local Development
@@ -439,11 +460,11 @@ use_distillation: false      # (ViT) Use self-distillation
 
 | Architecture | AUC-ROC | Params | Inference | Training |
 |---|---|---|---|---|
-| CNN (baseline) | 0.76 | 2M | 5ms | 15 min |
-| ViT-S | 0.87 | 22M | 30ms | 120 min |
-| ViT-S+Temporal | 0.88 | 22M | 31ms | 140 min |
-| ViT-S+Distill | 0.86 | 16M | 23ms | 150 min |
-| VideoMamba | 0.87 | 8M | 15ms | 100 min |
+| CNN (baseline) | TBD | ~2M | TBD | TBD |
+| ViT-S | TBD | ~22M | TBD | TBD |
+| ViT-S+Temporal | TBD | ~22M | TBD | TBD |
+| ViT-S+Distill | TBD | ~16M | TBD | TBD |
+| VideoMamba | TBD | ~8M | TBD | TBD |
 
 **Key Insights:**
 1. Temporal transformer adds 2-3 points AUC
@@ -570,7 +591,7 @@ To extend this project:
 @article{singh2025surveillai,
   title={SurveillAI-VAD: Spatial-Temporal Anomaly Detection for Surveillance Video},
   author={Singh, Prachet Dev},
-  year={2025}
+  year={2026}
 }
 ```
 
@@ -580,6 +601,6 @@ MIT License - See LICENSE file
 
 ---
 
-**Last Updated:** March 2025
+**Last Updated:** March 2026
 **Author:** Prachet Dev Singh
 **Status:** Complete Implementation ✓
