@@ -1,264 +1,336 @@
-"""
-Main training script for video anomaly detection models.
-Supports CNN, ViT, and Mamba architectures.
-"""
-
-import os
-import sys
-import yaml
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, random_split
-import numpy as np
-from pathlib import Path
-from tqdm import tqdm
 import argparse
-import matplotlib.pyplot as plt
-from datetime import datetime
+import os
+import yaml
+import numpy as np
+import sys
+from torch.utils.data import DataLoader
+from transformers import AutoModelForImageClassification
+import transformers
+import pytorch_msssim
 
-from data.dataset import SlidingWindowDataset
-from models.cnn_autoencoder import SimpleCNNAutoencoder
+sys.path.append(os.getcwd())
 
+# ─────────────────────────────────────────────────────────────
+# 1. CONFIGURATION
+# ─────────────────────────────────────────────────────────────
+class ConfigObject(dict):
+    def __getattr__(self, name):
+        if name in self: return self[name]
+        if name == 'data_dir': return self.get('dataset_dir', self.get('data_path', 'data/processed'))
+        if name == 'batch_size': return 4
+        if name == 'epochs': return 50
+        if name == 'learning_rate': return 1e-4
+        if name == 'model_type': return 'mamba'
+        raise AttributeError(f"'ConfigObject' has no attribute '{name}'")
+    def __setattr__(self, name, value):
+        self[name] = value
 
 def load_config(config_path):
-    """Load YAML configuration file."""
     with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)
-    return type('Config', (), config)()
+        data = yaml.safe_load(f)
+    return ConfigObject(data)
 
 
-def create_model(model_type, latent_dim=256, device='cpu'):
-    """Create model based on type."""
-    if model_type == 'cnn':
-        model = SimpleCNNAutoencoder(latent_dim=latent_dim)
+# ─────────────────────────────────────────────────────────────
+# 2. STRUCTURAL LOSS
+# ─────────────────────────────────────────────────────────────
+class StructuralLoss(nn.Module):
+    def __init__(self, alpha=0.3, beta=0.7):
+        super().__init__()
+        self.alpha, self.beta = alpha, beta
+        self.mse = nn.MSELoss()
+
+    def forward(self, recon, target):
+        mse_loss = self.mse(recon, target)
+        ssim_val = pytorch_msssim.ssim(recon, target, data_range=1.0, size_average=True)
+        return (self.alpha * mse_loss) + (self.beta * (1.0 - ssim_val))
+
+
+# ─────────────────────────────────────────────────────────────
+# 3. ENCODER — FIX #1: Extract backbone features, NOT logits
+#    MambaVision-T head is Linear(640 → 1000). We replace it
+#    with Identity() so the encoder outputs 640-d feature vectors
+#    instead of meaningless ImageNet class scores.
+# ─────────────────────────────────────────────────────────────
+transformers.PreTrainedModel.all_tied_weights_keys = property(lambda self: {})
+
+MAMBA_FEATURE_DIM = 640  # MambaVision-T backbone output dimension
+
+class MambaFeatureExtractor(nn.Module):
+    """
+    Loads MambaVision-T and removes the classification head so we get
+    real 640-d spatial feature vectors instead of 1000-d logits.
+    """
+    def __init__(self, freeze=True):
+        super().__init__()
+        # Patch linspace for CPU compat during init
+        _orig = torch.linspace
+        def _patched(*a, **kw):
+            kw['device'] = 'cpu'
+            return _orig(*a, **kw)
+        torch.linspace = _patched
+        self.backbone = AutoModelForImageClassification.from_pretrained(
+            "nvidia/MambaVision-T-1K",
+            trust_remote_code=True,
+            low_cpu_mem_usage=False,
+            _fast_init=False
+        )
+        torch.linspace = _orig
+
+        # ── KEY FIX: replace classifier head with Identity ──────────
+        # This makes forward() return 640-d features, not 1000-d logits
+        replaced = False
+        for head_name in ('head', 'classifier', 'fc'):
+            if hasattr(self.backbone, head_name):
+                head = getattr(self.backbone, head_name)
+                # Detect actual feature dim from the Linear layer
+                if hasattr(head, 'in_features'):
+                    global MAMBA_FEATURE_DIM
+                    MAMBA_FEATURE_DIM = head.in_features
+                setattr(self.backbone, head_name, nn.Identity())
+                replaced = True
+                break
+        if not replaced:
+            print("WARNING: Could not find classification head to replace. "
+                  "Features may still be logits.")
+
+        if freeze:
+            for p in self.backbone.parameters():
+                p.requires_grad = False
+
+    def forward(self, x):
+        out = self.backbone(x)
+        # Extract raw tensor from HuggingFace output wrapper
+        if hasattr(out, 'logits'):
+            feat = out.logits          # after head→Identity this is 640-d features
+        elif isinstance(out, dict):
+            feat = list(out.values())[0]
+        elif isinstance(out, (tuple, list)):
+            feat = out[0]
+        else:
+            feat = out
+
+        # Handle unexpected spatial output shapes (safety net)
+        if feat.dim() == 4:            # [B, C, H, W]
+            feat = F.adaptive_avg_pool2d(feat, 1).flatten(1)
+        elif feat.dim() == 3:          # [B, T, C] from SSM layers
+            feat = feat.mean(dim=1)
+
+        return feat  # [B, MAMBA_FEATURE_DIM]
+
+
+class TrainableMambaExtractor(MambaFeatureExtractor):
+    """Same as above but with backbone weights unfrozen for fine-tuning."""
+    def __init__(self):
+        super().__init__(freeze=False)
+
+
+# ─────────────────────────────────────────────────────────────
+# 4. MEMORY BANK — FIX #4: More slots + L2 normalisation
+#    With only 5 soft-attention slots, anomalous patterns can
+#    still be reconstructed as a mixture. More normalised slots
+#    make it harder to represent out-of-distribution inputs.
+# ─────────────────────────────────────────────────────────────
+class MemoryBank(nn.Module):
+    def __init__(self, num_slots=512, dim=256):
+        super().__init__()
+        # L2-normalised random init is much more stable than raw randn
+        mem = torch.randn(num_slots, dim)
+        mem = F.normalize(mem, dim=1)
+        self.memory = nn.Parameter(mem)
+
+    def forward(self, query):
+        # Normalise both query and memory before cosine similarity
+        q_norm = F.normalize(query, dim=1)               # [B, D]
+        m_norm = F.normalize(self.memory, dim=1)          # [N, D]
+        sim = torch.mm(q_norm, m_norm.t())                # [B, N]
+        weights = F.softmax(sim * 10, dim=1)              # [B, N]
+        return weights @ self.memory                       # [B, D]
+
+
+# ─────────────────────────────────────────────────────────────
+# 5. FULL AUTOENCODER
+# ─────────────────────────────────────────────────────────────
+from models.decoder import ReconstructionDecoder
+
+class MemoryBankAutoencoder(nn.Module):
+    def __init__(self, latent_dim=256, trainable_encoder=False, num_slots=512):
+        super().__init__()
+        self.encoder = TrainableMambaExtractor() if trainable_encoder \
+                       else MambaFeatureExtractor(freeze=True)
+        # GRU input size must match encoder output, NOT hardcoded to 1000
+        self.gru = nn.GRU(
+            input_size=MAMBA_FEATURE_DIM,  # 640, not 1000
+            hidden_size=512,
+            num_layers=2,
+            batch_first=True,
+            dropout=0.1
+        )
+        self.bottleneck = nn.Sequential(
+            nn.Linear(512, latent_dim),
+            nn.LayerNorm(latent_dim),
+            nn.GELU()
+        )
+        self.memory_bank = MemoryBank(num_slots=num_slots, dim=latent_dim)
+        self.decoder = ReconstructionDecoder(latent_dim=latent_dim)
+
+    def forward(self, x):
+        # x: [B, T, C, H, W] — never accept raw [B, C, H, W] silently
+        # FIX #3: removed the single-frame duplication fallback.
+        # If you get [B, C, H, W] it means the dataset is broken — fix the dataset.
+        if x.dim() == 4:
+            raise ValueError(
+                f"Expected 5D input [B, T, C, H, W] but got shape {x.shape}. "
+                "Check your SlidingWindowDataset — it should always return clips."
+            )
+        B, T, C, H, W = x.shape
+
+        # Encode each frame — only no_grad if encoder is frozen
+        encode_ctx = torch.no_grad() if not self.encoder.training else torch.enable_grad()
+        spatial_feats = []
+        with encode_ctx:
+            for t in range(T):
+                spatial_feats.append(self.encoder(x[:, t]))  # [B, 640]
+        sequence = torch.stack(spatial_feats, dim=1)          # [B, T, 640]
+
+        _, hidden = self.gru(sequence)   # hidden: [num_layers, B, 512]
+        z = self.bottleneck(hidden[-1])  # take last layer: [B, latent_dim]
+
+        mem_out = self.memory_bank(z)    # [B, latent_dim]
+        return self.decoder(mem_out)     # [B, 3, H, W]
+
+
+# ─────────────────────────────────────────────────────────────
+# 6. BATCH HELPER
+# ─────────────────────────────────────────────────────────────
+def process_batch(batch_data, device):
+    if isinstance(batch_data, (tuple, list)):
+        clips = batch_data[0]
+        target = batch_data[1] if len(batch_data) > 1 else clips[:, -1]
     else:
-        raise ValueError(f"Unknown model type: {model_type}")
-
-    return model.to(device)
-
-
-def train_epoch(model, train_loader, optimizer, device, use_clip=False):
-    """Train for one epoch."""
-    model.train()
-    total_loss = 0.0
-    num_batches = 0
-
-    pbar = tqdm(train_loader, desc="Training", leave=False)
-    for batch_idx, clips in enumerate(pbar):
-        # clips shape: (B, N_frames, C, H, W)
-        clips = clips.to(device)
-
-        # Get middle frame as target
-        target = clips[:, clips.shape[1] // 2, :, :, :]  # (B, C, H, W)
-
-        # For CNN baseline: pass middle frame to model
-        # TODO: For ViT/Temporal models, will need to handle the full clip
-
-        reconstructed = model(target)
-
-        # Calculate MSE loss
-        loss = F.mse_loss(reconstructed, target)
-
-        optimizer.zero_grad()
-        loss.backward()
-
-        if use_clip:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
-        optimizer.step()
-
-        total_loss += loss.item()
-        num_batches += 1
-
-        pbar.update(1)
-
-    avg_loss = total_loss / num_batches
-    return avg_loss
+        clips = batch_data
+        target = clips[:, -1]
+    if target.dim() == 5:
+        target = target[:, -1]
+    # Channel safety: match recon channels (always 3)
+    if target.dim() == 4 and target.shape[1] == 1:
+        target = target.repeat(1, 3, 1, 1)
+    return clips.to(device), target.to(device)
 
 
-def validate(model, val_loader, device):
-    """Validate model and return average loss."""
-    model.eval()
-    total_loss = 0.0
-    num_batches = 0
-
-    with torch.no_grad():
-        for clips in val_loader:
-            clips = clips.to(device)
-            target = clips[:, clips.shape[1] // 2, :, :, :]
-
-            reconstructed = model(target)
-            loss = F.mse_loss(reconstructed, target)
-
-            total_loss += loss.item()
-            num_batches += 1
-
-    avg_loss = total_loss / num_batches
-    return avg_loss
-
-
+# ─────────────────────────────────────────────────────────────
+# 7. TRAINING — FIX #5: gradient clipping + LR scheduler
+# ─────────────────────────────────────────────────────────────
 def train_model(config, model, train_loader, val_loader, device):
-    """
-    Main training loop.
+    lr = float(config.learning_rate)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
-    Returns:
-        model: Trained model
-        history: Dict with train/val losses
-    """
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=10
+    # Cosine annealing: smoothly decays LR to near-zero over all epochs
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=config.epochs, eta_min=lr * 0.01
     )
-
-    history = {'train_loss': [], 'val_loss': []}
+    criterion = StructuralLoss(alpha=0.3, beta=0.7)
     best_val_loss = float('inf')
-    patience_counter = 0
-    max_patience = 20
 
-    print(f"Training {config.model} model for {config.epochs} epochs...")
+    print(f"\n🚀 Training | {config.epochs} epochs | "
+          f"LR={lr} | Cosine scheduler | Grad clip=1.0")
 
     for epoch in range(config.epochs):
-        # Train
-        train_loss = train_epoch(model, train_loader, optimizer, device)
-        history['train_loss'].append(train_loss)
+        # ── Train ───────────────────────────────────────────────
+        model.train()
+        train_losses = []
+        for batch_data in train_loader:
+            clips, target = process_batch(batch_data, device)
+            optimizer.zero_grad()
+            recon = model(clips)
 
-        # Validate
-        val_loss = validate(model, val_loader, device)
-        history['val_loss'].append(val_loss)
+            # Ensure channel match after decode
+            if recon.shape[1] != target.shape[1]:
+                if target.shape[1] == 1: target = target.repeat(1, 3, 1, 1)
+                elif recon.shape[1] == 1: recon = recon.repeat(1, 3, 1, 1)
 
-        print(f"Epoch [{epoch+1}/{config.epochs}] "
-              f"Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}")
+            loss = criterion(recon, target)
+            loss.backward()
 
-        # Learning rate scheduling
-        scheduler.step(val_loss)
+            # FIX #5a: Gradient clipping prevents explosion when encoder is unfrozen
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
-        # Early stopping
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            patience_counter = 0
+            optimizer.step()
+            train_losses.append(loss.item())
 
-            # Save best model
-            checkpoint_path = f"checkpoints/{config.model}_best.pth"
+        # FIX #5b: Step LR scheduler after each epoch
+        scheduler.step()
+
+        # ── Validate ─────────────────────────────────────────────
+        model.eval()
+        val_losses = []
+        with torch.no_grad():
+            for batch_data in val_loader:
+                clips, target = process_batch(batch_data, device)
+                recon = model(clips)
+                if recon.shape[1] != target.shape[1]:
+                    if target.shape[1] == 1: target = target.repeat(1, 3, 1, 1)
+                    elif recon.shape[1] == 1: recon = recon.repeat(1, 3, 1, 1)
+                val_losses.append(criterion(recon, target).item())
+
+        avg_train = np.mean(train_losses)
+        avg_val   = np.mean(val_losses)
+        cur_lr    = scheduler.get_last_lr()[0]
+        print(f"Epoch {epoch+1:03d}/{config.epochs} | "
+              f"Train: {avg_train:.6f} | Val: {avg_val:.6f} | LR: {cur_lr:.2e}")
+
+        if avg_val < best_val_loss:
+            best_val_loss = avg_val
             os.makedirs('checkpoints', exist_ok=True)
-            torch.save(model.state_dict(), checkpoint_path)
-            print(f"  -> Saved best model to {checkpoint_path}")
-        else:
-            patience_counter += 1
-            if patience_counter >= max_patience:
-                print(f"Early stopping at epoch {epoch+1}")
-                break
-
-    return model, history
+            torch.save(model.state_dict(), f"checkpoints/{config.model_type}_best.pth")
+            print(f"   ⭐ Best model saved (Val: {best_val_loss:.6f})")
 
 
-def plot_training_history(history, model_name):
-    """Plot and save training history."""
-    plt.figure(figsize=(10, 6))
-    plt.plot(history['train_loss'], label='Train Loss', marker='o')
-    plt.plot(history['val_loss'], label='Val Loss', marker='s')
-    plt.xlabel('Epoch')
-    plt.ylabel('MSE Loss')
-    plt.title(f'{model_name.upper()} Training History')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-
-    os.makedirs('results', exist_ok=True)
-    plt.savefig(f'results/{model_name}_training_history.png', dpi=100, bbox_inches='tight')
-    print(f"Saved plot to results/{model_name}_training_history.png")
-    plt.close()
-
-
+# ─────────────────────────────────────────────────────────────
+# 8. ENTRY POINT
+# ─────────────────────────────────────────────────────────────
 def main():
-    parser = argparse.ArgumentParser(description='Train video anomaly detection model')
-    parser.add_argument('--config', type=str, required=True,
-                      help='Path to config YAML file')
-    parser.add_argument('--data_dir', type=str, default='data/processed/train',
-                      help='Path to processed training data')
-    parser.add_argument('--device', type=str, default='cpu',
-                      choices=['cpu', 'cuda'],
-                      help='Device to use for training')
-
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config',          required=True)
+    parser.add_argument('--device',          default='cuda')
+    parser.add_argument('--trainable',       action='store_true',
+                        help='Unfreeze Mamba encoder for fine-tuning')
+    parser.add_argument('--latent_dim',      type=int, default=256)
+    parser.add_argument('--num_slots',       type=int, default=512)
     args = parser.parse_args()
 
-    # Load config
     config = load_config(args.config)
     config.device = args.device
 
-    if config.device == 'cuda' and not torch.cuda.is_available():
-        print("CUDA not available, using CPU")
-        config.device = 'cpu'
+    from data.dataset import SlidingWindowDataset
+    train_dir = os.path.join(config.data_dir, 'train')
+    val_dir   = os.path.join(config.data_dir, 'test')
 
-    device = torch.device(config.device)
-    print(f"Using device: {device}")
-
-    # Load dataset
-    print(f"Loading dataset from {args.data_dir}...")
-
-    if not os.path.exists(args.data_dir):
-        print(f"Error: Data directory {args.data_dir} does not exist")
-        print("You need to preprocess the UCSD Ped2 dataset first:")
-        print("  python data/preprocess.py --dataset ucsd --input data/ucsd/ --output data/processed/")
-        sys.exit(1)
-
-    dataset = SlidingWindowDataset(
-        frame_dir=args.data_dir,
-        window_size=config.window_size,
-        stride=config.stride,
-        use_npy=True
-    )
-
-    print(f"Found {len(dataset)} clips")
-
-    if len(dataset) == 0:
-        print("Error: No data found. Make sure frames are stored as .npy files in:")
-        print(f"  {args.data_dir}/")
-        sys.exit(1)
-
-    # Split into train/val
-    train_size = int(0.8 * len(dataset))
-    val_size = len(dataset) - train_size
-    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+    # FIX #3: stride=4 during training is fine, but window_size must always
+    # return proper clips — no more single-frame fallback
+    train_dataset = SlidingWindowDataset(frame_dir=train_dir, window_size=8, stride=4)
+    val_dataset   = SlidingWindowDataset(frame_dir=val_dir,   window_size=8, stride=4)
 
     train_loader = DataLoader(
-        train_dataset,
-        batch_size=config.batch_size,
-        shuffle=True,
-        num_workers=0
+        train_dataset, batch_size=config.batch_size, shuffle=True,
+        num_workers=4, pin_memory=True
     )
-
     val_loader = DataLoader(
-        val_dataset,
-        batch_size=config.batch_size,
-        shuffle=False,
-        num_workers=0
+        val_dataset, batch_size=config.batch_size, shuffle=False,
+        num_workers=4, pin_memory=True
     )
 
-    print(f"Train set: {len(train_dataset)} clips")
-    print(f"Val set: {len(val_dataset)} clips")
+    model = MemoryBankAutoencoder(
+        latent_dim=args.latent_dim,
+        trainable_encoder=args.trainable,
+        num_slots=args.num_slots
+    ).to(args.device)
 
-    # Create model
-    model = create_model(config.model, latent_dim=config.latent_dim, device=device)
-
-    # Count parameters
-    num_params = sum(p.numel() for p in model.parameters())
-    print(f"Model: {config.model} | Parameters: {num_params:,}")
-
-    # Train
-    model, history = train_model(config, model, train_loader, val_loader, device)
-
-    # Save final model
-    os.makedirs('checkpoints', exist_ok=True)
-    final_checkpoint = f"checkpoints/{config.model}_final.pth"
-    torch.save(model.state_dict(), final_checkpoint)
-    print(f"Saved final model to {final_checkpoint}")
-
-    # Plot history
-    plot_training_history(history, config.model)
-
-    print("\nTraining complete!")
-    print(f"Best validation loss: {min(history['val_loss']):.6f}")
+    train_model(config, model, train_loader, val_loader, args.device)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
